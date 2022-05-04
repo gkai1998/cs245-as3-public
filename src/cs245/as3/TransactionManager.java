@@ -1,7 +1,7 @@
 package cs245.as3;
 
-import java.util.ArrayList;
-import java.util.HashMap;
+import java.nio.ByteBuffer;
+import java.util.*;
 
 import cs245.as3.interfaces.LogManager;
 import cs245.as3.interfaces.StorageManager;
@@ -35,19 +35,69 @@ public class TransactionManager {
 	  * Hold on to writesets until commit.
 	  */
 	private HashMap<Long, ArrayList<WritesetEntry>> writesets;
-
+	public StorageManager sm;
+	public LogManager lm;
+	LinkedHashMap<Integer,HashSet<Long>> keytag;
 	public TransactionManager() {
 		writesets = new HashMap<>();
+		keytag=new LinkedHashMap<>();
 		//see initAndRecover
 		latestValues = null;
 	}
-
 	/**
 	 * Prepare the transaction manager to serve operations.
 	 * At this time you should detect whether the StorageManager is inconsistent and recover it.
 	 */
 	public void initAndRecover(StorageManager sm, LogManager lm) {
 		latestValues = sm.readStoredTable();
+		this.sm=sm;
+		this.lm=lm;
+		Map<Long,Integer> TxnTag=new HashMap<>();
+		int logCurOffset=lm.getLogTruncationOffset();
+		int logEndOffset=lm.getLogEndOffset();
+		while(logCurOffset<logEndOffset){
+			ByteBuffer header=ByteBuffer.allocate(14);
+			header.put(lm.readLogRecord(logCurOffset,14));
+			logCurOffset+=14;
+			char flag=header.getChar(0);
+			long txnid=header.getLong(2);
+			switch (flag){
+				case 's':
+					TxnTag.put(txnid, (logCurOffset-14));
+					break;
+				case 'r':
+					int length=header.getInt(10);
+					ByteBuffer txnrecord=ByteBuffer.allocate(length);
+					txnrecord.put(lm.readLogRecord(logCurOffset,length));
+					long key = txnrecord.getLong(0);
+					byte[] entrytobyte = txnrecord.array();
+					byte[] value = new byte[entrytobyte.length - 8];
+					for (int i = 8, j = 0; i < entrytobyte.length; i++, j++) {
+						value[j] = entrytobyte[i];
+					}
+					write(txnid,key,value);
+					logCurOffset+=length;
+					break;
+				case 'e':
+					ArrayList<WritesetEntry> writeset = writesets.get(txnid);
+					//  write txn start entry
+					long tag = TxnTag.get(txnid);
+					if (writeset != null) {
+						HashSet<Long> keyset=new HashSet<>();
+						for(WritesetEntry x : writeset) {
+							sm.queueWrite(x.key, tag, x.value);
+							latestValues.put(x.key, new TaggedValue(0, x.value));
+							keyset.add(x.key);
+						}
+						keytag.put((int)tag,keyset);
+						writesets.remove(txnid);
+					}
+					break;
+				default:
+					throw new RuntimeException("log analysis error");
+			}
+		}
+
 	}
 
 	/**
@@ -83,20 +133,42 @@ public class TransactionManager {
 	 */
 	public void commit(long txID) {
 		ArrayList<WritesetEntry> writeset = writesets.get(txID);
+		//  write txn start entry
 		if (writeset != null) {
 			for(WritesetEntry x : writeset) {
-				//tag is unused in this implementation:
-				long tag = 0;
-				latestValues.put(x.key, new TaggedValue(tag, x.value));
+				latestValues.put(x.key, new TaggedValue(0, x.value));
 			}
-			writesets.remove(txID);
+			ByteBuffer txnstartflag=ByteBuffer.allocate(14);
+			txnstartflag.putChar('s'); //s means txn start
+			txnstartflag.putLong(txID);
+			txnstartflag.putInt(0); //Add redundancy to align the headers of the log entry
+			int tag=lm.appendLogRecord(txnstartflag.array());
+			for(WritesetEntry x : writeset) {
+				// write log entry
+				writeRedoLog(txID, x);
+			}
+			// write txn end entry
+			ByteBuffer txnendflag=ByteBuffer.allocate(14);
+			txnendflag.putChar('e'); //e means txn end
+			txnendflag.putLong(txID);
+			txnendflag.putInt(0); //Add redundancy to align the headers of the log entry
+			lm.appendLogRecord(txnendflag.array());
+
+			HashSet<Long> keyset=new HashSet<>();
+			for(WritesetEntry x : writeset) {
+				sm.queueWrite(x.key, tag, x.value);
+				keyset.add(x.key);
+			}
+			keytag.put(tag,keyset);
 		}
+		writesets.remove(txID);
 	}
 	/**
 	 * Aborts a transaction.
 	 */
 	public void abort(long txID) {
 		writesets.remove(txID);
+
 	}
 
 	/**
@@ -104,5 +176,34 @@ public class TransactionManager {
 	 * These calls are in order of writes to a key and will occur once for every such queued write, unless a crash occurs.
 	 */
 	public void writePersisted(long key, long persisted_tag, byte[] persisted_value) {
+		if(!keytag.containsKey((int)persisted_tag)){
+			return;
+		}
+		HashSet<Long> keyset=keytag.get((int)persisted_tag);
+
+		if(keyset.contains(key)) {
+			keyset.remove(key);
+		}
+		if (keyset.size()==0){
+			keytag.remove((int)persisted_tag);
+		}
+		if (keytag.size()!=0){
+			Map.Entry<Integer,HashSet<Long>> fitst=keytag.entrySet().iterator().next();
+			long tag=fitst.getKey();
+			lm.setLogTruncationOffset((int)tag);
+			return;
+		}else {
+			lm.setLogTruncationOffset(lm.getLogEndOffset());
+		}
 	}
+	public void writeRedoLog(long txID,WritesetEntry x){
+		ByteBuffer logbyte=ByteBuffer.allocate(22+x.value.length);
+		logbyte.putChar('r');
+		logbyte.putLong(txID);
+		logbyte.putInt(8+x.value.length);
+		logbyte.putLong(x.key);
+		logbyte.put(x.value);
+		lm.appendLogRecord(logbyte.array());
+	}
+
 }
