@@ -37,7 +37,7 @@ public class TransactionManager {
 	private HashMap<Long, ArrayList<WritesetEntry>> writesets;
 	public StorageManager sm;
 	public LogManager lm;
-	LinkedHashMap<Integer,HashSet<Long>> keytag;
+	LinkedHashMap<Integer,HashSet<Long>> keytag;  //for fuzzy checkpoint
 	public TransactionManager() {
 		writesets = new HashMap<>();
 		keytag=new LinkedHashMap<>();
@@ -116,9 +116,9 @@ public class TransactionManager {
 	}
 
 	/**
-	 * Indicates a write to the database. Note that such writes should not be visible to read() 
-	 * calls until the transaction making the write commits. For simplicity, we will not make reads 
-	 * to this same key from txID itself after we make a write to the key. 
+	 * Indicates a write to the database. Note that such writes should not be visible to read()
+	 * calls until the transaction making the write commits. For simplicity, we will not make reads
+	 * to this same key from txID itself after we make a write to the key.
 	 */
 	public void write(long txID, long key, byte[] value) {
 		ArrayList<WritesetEntry> writeset = writesets.get(txID);
@@ -130,6 +130,22 @@ public class TransactionManager {
 	}
 	/**
 	 * Commits a transaction, and makes its writes visible to subsequent read operations.\
+	 *
+	 * 日志格式
+	 * txn start
+	 * ------------------------------
+	 * | 's' (2) | txID (8) | 0 (4) |
+	 * ------------------------------
+	 *
+	 * txn log record
+	 * -----------------------------------------------------
+	 * | 'r' (2) | txID (8) | length (4) | key (8) | value |
+	 * -----------------------------------------------------
+	 *
+	 * txn commit
+	 * ------------------------------
+	 * | 'e' (2) | txID (8) | 0 (4) |
+	 * ------------------------------
 	 */
 	public void commit(long txID) {
 		ArrayList<WritesetEntry> writeset = writesets.get(txID);
@@ -162,6 +178,16 @@ public class TransactionManager {
 			keytag.put(tag,keyset);
 		}
 		writesets.remove(txID);
+	}
+
+	public void writeRedoLog(long txID,WritesetEntry x){
+		ByteBuffer logbyte=ByteBuffer.allocate(22+x.value.length);
+		logbyte.putChar('r');
+		logbyte.putLong(txID);
+		logbyte.putInt(8+x.value.length);
+		logbyte.putLong(x.key);
+		logbyte.put(x.value);
+		lm.appendLogRecord(logbyte.array());
 	}
 	/**
 	 * Aborts a transaction.
@@ -196,14 +222,6 @@ public class TransactionManager {
 			lm.setLogTruncationOffset(lm.getLogEndOffset());
 		}
 	}
-	public void writeRedoLog(long txID,WritesetEntry x){
-		ByteBuffer logbyte=ByteBuffer.allocate(22+x.value.length);
-		logbyte.putChar('r');
-		logbyte.putLong(txID);
-		logbyte.putInt(8+x.value.length);
-		logbyte.putLong(x.key);
-		logbyte.put(x.value);
-		lm.appendLogRecord(logbyte.array());
-	}
+
 
 }
